@@ -27,6 +27,7 @@ from multiprocessing.connection import Connection
 from time import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import pickle
 import cloudpickle
 import numpy as np
 import torch
@@ -157,12 +158,12 @@ def _scheduler_worker_process(
 
     def _send_result(result):
         """Send result back using cloudpickle serialization."""
-        output_conn.send_bytes(cloudpickle.dumps(result))
+        output_conn.send_bytes(pickle.dumps(result, protocol=5))
 
     # Process commands from the input connection
     while True:
         try:
-            command, data = cloudpickle.loads(input_conn.recv_bytes())
+            command, data = pickle.loads(input_conn.recv_bytes())
 
             match command:
                 case SchedulerCommand.ADD_REQUEST:
@@ -453,7 +454,7 @@ class DPScheduler(SchedulerInterface):
                       data: Any = None) -> None:
         """Send a command to a worker process via its input pipe."""
         start_time = time()
-        payload = cloudpickle.dumps((command, data))
+        payload = pickle.dumps((command, data), protocol=5)
         serialize_time = time() - start_time
         self.input_conns[rank].send_bytes(payload)
         send_time = time() - start_time
@@ -484,7 +485,7 @@ class DPScheduler(SchedulerInterface):
             if gc_was_enabled:
                 gc.disable()
 
-            result = cloudpickle.loads(raw_bytes)
+            result = pickle.loads(raw_bytes)
             deserialize_time = time()
 
             if gc_was_enabled:
