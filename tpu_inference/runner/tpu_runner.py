@@ -1372,38 +1372,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _apply_async_token_substitution(self, input_ids,
                                         token_in_tpu_cur_input_indices,
-                                        token_in_tpu_pre_next_tokens_indices):
-        """Apply async token substitution if needed."""
-        if len(token_in_tpu_cur_input_indices) == 0:
-            return input_ids
-
-        idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-
-        # Pad according to the instructions written inside self._substitute_placeholder_token_fn
-        full_range = np.arange(0, len(input_ids), dtype=np.int32)
-        mask = np.ones(len(input_ids), dtype=bool)
-        mask[token_in_tpu_cur_input_indices] = False
-        missing_values = full_range[mask]
-        padded_token_in_tpu_cur_input_indices = np.concatenate(
-            (token_in_tpu_cur_input_indices, missing_values))
-
-        padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-            token_in_tpu_pre_next_tokens_indices, (0, idx_pad_len),
-            mode='constant',
-            constant_values=-1).astype(np.int32)
-
-        (padded_token_in_tpu_cur_input_indices,
-         padded_token_in_tpu_pre_next_tokens_indices) = device_array(
-             self.mesh, (padded_token_in_tpu_cur_input_indices,
-                         padded_token_in_tpu_pre_next_tokens_indices))
-
+                                        token_in_tpu_pre_next_tokens_indices,
+                                        num_valid_sub_indices: int):
+        """Apply async token substitution using DeviceBuffer metadata."""
         with self.maybe_forbid_compile:
             input_ids = self._substitute_placeholder_token_fn(
-                input_ids, padded_token_in_tpu_cur_input_indices,
-                padded_token_in_tpu_pre_next_tokens_indices,
+                input_ids, token_in_tpu_cur_input_indices,
+                token_in_tpu_pre_next_tokens_indices,
                 self._pre_async_results.next_tokens,
-                jnp.asarray(len(token_in_tpu_cur_input_indices),
-                            dtype=jnp.int32))
+                jnp.asarray(num_valid_sub_indices, dtype=jnp.int32))
 
         return input_ids
 
@@ -1621,6 +1598,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding=data_parallel_attn_sharding,
         )
 
+        positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
+        if not self.uses_mrope:
+            pos_view = self.device_buffer.get_view(
+                (padded_total_num_scheduled_tokens, ), key="positions")
+            pos_view[:] = positions
+
+        num_valid_sub_indices = 0
+        if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            all_token_indices_to_substitute = []
+            all_pre_next_tokens_indices = []
+
+            for dp_rank in range(dp_size):
+                cur_indices = token_in_tpu_cur_input_indices_dp[dp_rank]
+                pre_indices = token_in_tpu_pre_next_tokens_indices_dp[dp_rank]
+                all_token_indices_to_substitute.extend(cur_indices)
+                all_pre_next_tokens_indices.extend(pre_indices)
+
+            num_valid_sub_indices = len(all_token_indices_to_substitute)
+            if num_valid_sub_indices > 0:
+                cur_view = self.device_buffer.get_view(
+                    (padded_total_num_scheduled_tokens, ), key="async_cur_indices")
+                pre_view = self.device_buffer.get_view(
+                    (padded_total_num_scheduled_tokens, ), key="async_pre_indices")
+
+                token_in_tpu_cur_input_indices = np.array(
+                    all_token_indices_to_substitute, dtype=np.int32)
+                token_in_tpu_pre_next_tokens_indices = np.array(
+                    all_pre_next_tokens_indices, dtype=np.int32)
+
+                full_range = np.arange(0, padded_total_num_scheduled_tokens, dtype=np.int32)
+                mask = np.ones(padded_total_num_scheduled_tokens, dtype=bool)
+                mask[token_in_tpu_cur_input_indices] = False
+                missing_values = full_range[mask]
+
+                cur_view[:num_valid_sub_indices] = token_in_tpu_cur_input_indices
+                cur_view[num_valid_sub_indices:] = missing_values
+
+                pre_view[:num_valid_sub_indices] = token_in_tpu_pre_next_tokens_indices
+                pre_view[num_valid_sub_indices:] = -1
+
         if self.uses_mrope:
             # M-RoPE positions are of the shape (3, max_num_tokens).
             # https://github.com/vllm-project/tpu-inference/blob/efc9608acd925bb3b64db6fda509514f799ab7be/tpu_inference/runner/tpu_runner.py#L555
@@ -1630,10 +1647,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             positions = device_array(self.mesh,
                                      mrope_positions,
                                      sharding=mrope_sharding)
-        else:
-            positions = device_array(self.mesh,
-                                     positions,
-                                     sharding=data_parallel_attn_sharding)
         t_pi_dev_pos = time.perf_counter()
 
         # Collect block tables host arrays loops zone presence zones legality
@@ -1699,6 +1712,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
+        if not self.uses_mrope:
+            positions = metadata["positions"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -1734,24 +1749,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
-            # Collect all token indices that need substitution across all DP ranks
-            all_token_indices_to_substitute = []
-            all_pre_next_tokens_indices = []
-
-            for dp_rank in range(dp_size):
-                cur_indices = token_in_tpu_cur_input_indices_dp[dp_rank]
-                pre_indices = token_in_tpu_pre_next_tokens_indices_dp[dp_rank]
-                all_token_indices_to_substitute.extend(cur_indices)
-                all_pre_next_tokens_indices.extend(pre_indices)
-
-            if len(all_token_indices_to_substitute) > 0:
-                token_in_tpu_cur_input_indices = np.array(
-                    all_token_indices_to_substitute)
-                token_in_tpu_pre_next_tokens_indices = np.array(
-                    all_pre_next_tokens_indices)
+            if "async_cur_indices" in metadata:
                 input_ids = self._apply_async_token_substitution(
-                    input_ids, token_in_tpu_cur_input_indices,
-                    token_in_tpu_pre_next_tokens_indices)
+                    input_ids, metadata["async_cur_indices"],
+                    metadata["async_pre_indices"], num_valid_sub_indices)
 
         num_scheduled_tokens_per_req = np.concatenate([
             np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
