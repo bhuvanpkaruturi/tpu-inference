@@ -863,8 +863,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
         intermediate_tensors: Optional[JaxIntermediateTensors] = None,
     ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
+        import time
+        t_em_start = time.perf_counter()
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
+        t_em_up = time.perf_counter()
         if not scheduler_output.total_num_scheduled_tokens:
             if has_kv_transfer_group():
                 return self.kv_connector_no_forward(scheduler_output,
@@ -893,6 +896,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector,
             padded_num_reqs,
         ) = self._prepare_inputs(scheduler_output)
+        t_em_prep = time.perf_counter()
 
         # multi-modal support
         if self.is_multimodal_model:
@@ -1000,6 +1004,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector=logits_indices_selector,
             padded_num_reqs=padded_num_reqs,
             expert_indices=expert_indices)
+        t_em_end = time.perf_counter()
+        logger.info(f"[AGENT_METRIC_EXECUTE_MODEL] total={(t_em_end-t_em_start)*1000:.3f}ms | persistent_update={(t_em_up-t_em_start)*1000:.3f}ms | prep_inputs={(t_em_prep-t_em_up)*1000:.3f}ms | model_forward={(t_em_end-t_em_prep)*1000:.3f}ms")
         return None
 
     def _sample_from_logits(
@@ -1402,6 +1408,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return input_ids
 
     def _prepare_inputs(self, scheduler_output: "VllmSchedulerOutput"):
+        import time
+        t_pi_start = time.perf_counter()
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1418,6 +1426,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          padded_num_reqs_per_dp_rank, logits_indices_selector,
          max_num_reqs_per_dp_rank
          ) = self._prepare_input_metadata(scheduler_output)
+        t_pi_meta = time.perf_counter()
         # Multi-modal support
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1435,6 +1444,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              ) = self._prepare_async_token_substitution_indices(
                  req_ids_dp, scheduled_tokens_per_dp_rank,
                  padded_num_scheduled_tokens_per_dp_rank, dp_size)
+        t_pi_async_prep = time.perf_counter()
 
         self.device_buffer.reset()
 
@@ -1601,6 +1611,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 ))
             logits_indices_view[:] = spec_decode_metadata.final_logits_indices.ravel(
             )
+        t_pi_pop = time.perf_counter()
 
         # Put to device
         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
@@ -1623,6 +1634,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             positions = device_array(self.mesh,
                                      positions,
                                      sharding=data_parallel_attn_sharding)
+        t_pi_dev_pos = time.perf_counter()
 
         # Collect block tables host arrays loops zone presence zones legality
         def build_block_table_host(kv_cache_gid: int) -> None:
@@ -1657,6 +1669,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups):
                 build_block_table_host(gid)
+        t_pi_block_tbl = time.perf_counter()
 
         metadata_blob, metadata_layout = self.device_buffer.build()
 
@@ -1717,6 +1730,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
             }
+        t_pi_dev_blob = time.perf_counter()
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
@@ -1749,6 +1763,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 total_num_scheduled_tokens,
                 padded_total_num_scheduled_tokens,
             )
+        t_pi_end = time.perf_counter()
+        logger.info(f"[AGENT_METRIC_PREPARE_INPUTS] total={(t_pi_end-t_pi_start)*1000:.3f}ms | meta={(t_pi_meta-t_pi_start)*1000:.3f}ms | async_prep={(t_pi_async_prep-t_pi_meta)*1000:.3f}ms | populate={(t_pi_pop-t_pi_async_prep)*1000:.3f}ms | dev_pos={(t_pi_dev_pos-t_pi_pop)*1000:.3f}ms | block_table={(t_pi_block_tbl-t_pi_dev_pos)*1000:.3f}ms | dev_blob={(t_pi_dev_blob-t_pi_block_tbl)*1000:.3f}ms | async_sub={(t_pi_end-t_pi_dev_blob)*1000:.3f}ms")
 
         return (
             input_ids,
