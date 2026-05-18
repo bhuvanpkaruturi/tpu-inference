@@ -1503,13 +1503,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
             # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
             # where M is the max_model_len.
-            token_indices = (
-                positions_np +
-                req_indices * self.input_batch.token_ids_cpu.shape[1])
-            np.take(
-                self.input_batch.token_ids_cpu.ravel(),
-                token_indices,
-                out=input_ids_cpu[:total_num_scheduled_tokens],
+            input_ids_cpu[:total_num_scheduled_tokens] = (
+                self.input_batch.token_ids_cpu[req_indices, positions_np]
             )
 
             input_ids_cpu[total_num_scheduled_tokens:] = 0
