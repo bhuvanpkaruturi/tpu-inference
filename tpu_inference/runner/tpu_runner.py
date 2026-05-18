@@ -1375,8 +1375,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Pad according to the instructions written inside self._substitute_placeholder_token_fn
         full_range = np.arange(0, len(input_ids), dtype=np.int32)
-        missing_values = np.setdiff1d(full_range,
-                                      token_in_tpu_cur_input_indices)
+        mask = np.ones(len(input_ids), dtype=bool)
+        mask[token_in_tpu_cur_input_indices] = False
+        missing_values = full_range[mask]
         padded_token_in_tpu_cur_input_indices = np.concatenate(
             (token_in_tpu_cur_input_indices, missing_values))
 
@@ -1485,20 +1486,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Get request indices.
             # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
             # For each scheduled token, what are the corresponding req index.
-            req_indices = np.repeat(req_indices_dp[dp_rank],
-                                    num_scheduled_tokens_per_req)
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            # For each scheduled token, what is its position in corresponding req.
-            arange = np.concatenate(
-                [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
-            # Get positions.
-            positions_np = positions_cpu[:total_num_scheduled_tokens]
-            np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
-                arange,
-                out=positions_np,
-            )
+            if total_num_scheduled_tokens == len(req_indices_dp[dp_rank]):
+                req_indices = req_indices_dp[dp_rank]
+                positions_np = positions_cpu[:total_num_scheduled_tokens]
+                positions_np[:] = self.input_batch.num_computed_tokens_cpu[req_indices]
+            else:
+                req_indices = np.repeat(req_indices_dp[dp_rank],
+                                        num_scheduled_tokens_per_req)
+                # Get batched arange.
+                # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+                # For each scheduled token, what is its position in corresponding req.
+                arange = np.concatenate(
+                    [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
+                # Get positions.
+                positions_np = positions_cpu[:total_num_scheduled_tokens]
+                np.add(
+                    self.input_batch.num_computed_tokens_cpu[req_indices],
+                    arange,
+                    out=positions_np,
+                )
             # Get token indices.
             # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
             # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
