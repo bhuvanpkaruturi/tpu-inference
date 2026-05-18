@@ -175,6 +175,9 @@ class ExecuteModelState:
     logits_indices_selector: Optional[List[int]] = None
     padded_num_reqs: Optional[int] = None
     expert_indices: Optional[jax.Array] = None
+    snapshot_req_ids: Optional[List[str]] = None
+    snapshot_req_id_to_index: Optional[Dict[str, int]] = None
+    snapshot_num_reqs: Optional[int] = None
 
 
 @jax.jit(donate_argnums=(0, 1, 2))
@@ -748,7 +751,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         (scheduler_output, attn_metadata, sampling_metadata, input_ids,
          hidden_states, logits, aux_hidden_states, spec_decode_metadata,
          kv_connector_output, logits_indices_selector, padded_num_reqs,
-         expert_indices) = (self.execute_model_state.scheduler_output,
+         expert_indices, snapshot_req_ids, snapshot_req_id_to_index,
+         snapshot_num_reqs) = (self.execute_model_state.scheduler_output,
                             self.execute_model_state.attn_metadata,
                             self.execute_model_state.sampling_metadata,
                             self.execute_model_state.input_ids,
@@ -759,7 +763,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                             self.execute_model_state.kv_connector_output,
                             self.execute_model_state.logits_indices_selector,
                             self.execute_model_state.padded_num_reqs,
-                            self.execute_model_state.expert_indices)
+                            self.execute_model_state.expert_indices,
+                            self.execute_model_state.snapshot_req_ids,
+                            self.execute_model_state.snapshot_req_id_to_index,
+                            self.execute_model_state.snapshot_num_reqs)
         self.execute_model_state = None
 
         if grammar_output is not None:
@@ -777,7 +784,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             scheduler_output, attn_metadata, sampling_metadata, input_ids,
             hidden_states, logits, aux_hidden_states, spec_decode_metadata,
             kv_connector_output, logits_indices_selector, padded_num_reqs,
-            expert_indices)
+            expert_indices, snapshot_req_ids, snapshot_req_id_to_index,
+            snapshot_num_reqs)
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -1005,7 +1013,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             kv_connector_output=kv_connector_output,
             logits_indices_selector=logits_indices_selector,
             padded_num_reqs=padded_num_reqs,
-            expert_indices=expert_indices)
+            expert_indices=expert_indices,
+            snapshot_req_ids=list(self.input_batch.req_ids[:self.input_batch.num_reqs]),
+            snapshot_req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            snapshot_num_reqs=self.input_batch.num_reqs)
         t_em_end = time.perf_counter()
         logger.info(f"[AGENT_METRIC_EXECUTE_MODEL] total={(t_em_end-t_em_start)*1000:.3f}ms | persistent_update={(t_em_up-t_em_start)*1000:.3f}ms | prep_inputs={(t_em_prep-t_em_up)*1000:.3f}ms | model_forward={(t_em_end-t_em_prep)*1000:.3f}ms")
         return None
@@ -1024,6 +1035,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
         expert_indices: Optional[jax.Array] = None,
+        snapshot_req_ids: Optional[List[str]] = None,
+        snapshot_req_id_to_index: Optional[Dict[str, int]] = None,
+        snapshot_num_reqs: Optional[int] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
@@ -1085,13 +1099,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             else:
                 logprobs = None
 
-        num_reqs = self.input_batch.num_reqs
+        num_reqs = snapshot_num_reqs if snapshot_num_reqs is not None else self.input_batch.num_reqs
+        src_req_ids = snapshot_req_ids if snapshot_req_ids is not None else self.input_batch.req_ids
+        src_req_id_to_index = snapshot_req_id_to_index if snapshot_req_id_to_index is not None else self.input_batch.req_id_to_index
 
         # Update the cache state concurrently. Code above will not block until
         # We use `selected_token_ids`. Add mark_step if post-processing changes
         request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices = []
-        for i, req_id in zip(range(num_reqs), self.input_batch.req_ids):
+        for i, req_id in zip(range(num_reqs), src_req_ids):
             assert req_id is not None
             req_state = self.requests[req_id]
             seq_len = (req_state.num_computed_tokens +
@@ -1112,11 +1128,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         assert all(
             req_id is not None for req_id in
-            self.input_batch.req_ids[:num_reqs]), "req_ids contains None"
-        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+            src_req_ids[:num_reqs]), "req_ids contains None"
+        req_ids = cast(list[str], src_req_ids[:num_reqs])
 
         prompt_logprobs_dict = {}
-        for req_id in self.input_batch.req_ids[:num_reqs]:
+        for req_id in req_ids:
             prompt_logprobs_dict[req_id] = None
 
         if self.speculative_config:
@@ -1159,7 +1175,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Return Model output to executor
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                req_id_to_index=src_req_id_to_index.copy(),
                 sampled_token_ids=[],  # Fill in async get
                 logprobs=None,
                 prompt_logprobs_dict=prompt_logprobs_dict,
@@ -1211,7 +1227,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_id_to_index=src_req_id_to_index.copy(),
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
