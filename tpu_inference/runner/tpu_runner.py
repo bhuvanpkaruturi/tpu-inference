@@ -703,8 +703,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         initial_capacity = (sampling_params_size + input_ids_size +
                             query_start_loc_size + seq_lens_size +
                             logits_indices_size + block_tables_size)
-        self.device_buffer = common_utils.DeviceBuffer(
-            initial_capacity=initial_capacity)
+        self.device_buffers = [common_utils.DeviceBuffer(
+            initial_capacity=initial_capacity) for _ in range(2)]
+        self.device_buffer = self.device_buffers[0]
+        self._buf_idx = 0
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
@@ -1423,6 +1425,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  padded_num_scheduled_tokens_per_dp_rank, dp_size)
         t_pi_async_prep = time.perf_counter()
 
+        self._buf_idx = getattr(self, "_buf_idx", 0) + 1
+        self.device_buffer = self.device_buffers[self._buf_idx % 2]
         self.device_buffer.reset()
 
         input_ids_view = self.device_buffer.get_view(
