@@ -394,6 +394,7 @@ class TPUWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
+        **kwargs,
     ) -> Optional[ModelRunnerOutput]:
         # NOTE: This method intentionally returns a concrete vLLM type, which
         # violates the pure abstract contract of the base class. This is a
@@ -414,7 +415,8 @@ class TPUWorker(WorkerBase):
                 intermediate_tensors_dict)
 
         output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+                                                 intermediate_tensors,
+                                                 **kwargs)
 
         if isinstance(output, JaxIntermediateTensors):
             assert self.parallel_config.pipeline_parallel_size > 1
