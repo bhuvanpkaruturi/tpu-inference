@@ -381,6 +381,22 @@ def _reconstruct_routed_experts(
     return routed_experts
 
 
+import copy
+
+class PreparedBatch:
+    def __init__(self, scheduler_output, input_ids, input_positions, attn_metadata, sampling_metadata, logits_indices, spec_decode_metadata, logits_indices_selector, padded_num_reqs, input_batch):
+        self.scheduler_output = scheduler_output
+        self.input_ids = input_ids
+        self.input_positions = input_positions
+        self.attn_metadata = attn_metadata
+        self.sampling_metadata = sampling_metadata
+        self.logits_indices = logits_indices
+        self.spec_decode_metadata = spec_decode_metadata
+        self.logits_indices_selector = logits_indices_selector
+        self.padded_num_reqs = padded_num_reqs
+        self.input_batch = copy.deepcopy(input_batch)
+
+
 class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def __init__(
@@ -733,6 +749,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Initialize to a constant size, and resize later after kv cache size is
         # known.
         self.device_buffer = common_utils.DeviceBuffer(initial_capacity=1024)
+        self.prepared_batches = []
+        self.prepared_execute_states = []
 
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
@@ -884,6 +902,104 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def capture_model(self) -> None:
         self.compilation_manager.capture_model()
 
+    def prepare_only(self, scheduler_output: "VllmSchedulerOutput") -> None:
+        self.persistent_batch_manager.update_states(
+            scheduler_output, self.get_mrope_input_positions_fn)
+
+        (
+            input_ids,
+            input_positions,
+            attn_metadata,
+            sampling_metadata,
+            logits_indices,
+            spec_decode_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+        ) = self._prepare_inputs(scheduler_output)
+
+        batch = PreparedBatch(
+            scheduler_output=scheduler_output,
+            input_ids=input_ids,
+            input_positions=input_positions,
+            attn_metadata=attn_metadata,
+            sampling_metadata=sampling_metadata,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            logits_indices_selector=logits_indices_selector,
+            padded_num_reqs=padded_num_reqs,
+            input_batch=self.input_batch,
+        )
+        self.prepared_batches.append(batch)
+
+    def dispatch_prepared_batch(self) -> ModelRunnerOutput | None:
+        if not self.prepared_batches:
+            return None
+        batch = self.prepared_batches.pop(0)
+
+        self.input_batch = batch.input_batch
+
+        scheduler_output = batch.scheduler_output
+        input_ids = batch.input_ids
+        input_positions = batch.input_positions
+        attn_metadata = batch.attn_metadata
+        logits_indices = batch.logits_indices
+        logits_indices_selector = batch.logits_indices_selector
+        padded_num_reqs = batch.padded_num_reqs
+        sampling_metadata = batch.sampling_metadata
+        spec_decode_metadata = batch.spec_decode_metadata
+
+        # Run forward pass
+        mm_embeds, is_mm_embed = None, None
+        input_ids, inputs_embeds = self._get_input_ids_embeds(
+            input_ids, mm_embeds, is_mm_embed)
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+
+        with self.maybe_forbid_compile:
+            with set_forward_context(
+                    None,
+                    self.vllm_config,
+            ), self.maybe_get_kv_connector_output(
+                    scheduler_output) as kv_connector_output:
+                (self.kv_caches, hidden_states, aux_hidden_states,
+                 expert_indices) = self.model_fn(
+                      self.state_leaves,
+                      self.kv_caches,
+                      input_ids,
+                      attn_metadata,
+                      inputs_embeds,
+                      input_positions,
+                      tuple(self.layer_name_to_kvcache_index.items()),
+                      lora_metadata,
+                      None,
+                      self.is_first_rank,
+                      self.is_last_rank,
+                  )
+
+        hidden_states = self._select_from_array_fn(hidden_states,
+                                                   logits_indices)
+        logits = self.compute_logits_fn(
+            self.state,
+            hidden_states,
+            lora_metadata,
+        )
+
+        state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            attn_metadata=attn_metadata,
+            sampling_metadata=sampling_metadata,
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            logits=logits,
+            aux_hidden_states=aux_hidden_states,
+            spec_decode_metadata=spec_decode_metadata,
+            kv_connector_output=kv_connector_output,
+            logits_indices_selector=logits_indices_selector,
+            padded_num_reqs=padded_num_reqs,
+            expert_indices=expert_indices,
+        )
+        self.prepared_execute_states.append(state)
+        return None
+
     @time_function
     def execute_model(
         self,
@@ -911,33 +1027,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self,
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
-        if self.execute_model_state is None:
+        if not self.prepared_execute_states:
             # This can happen in pipeline parallel case.
             return EMPTY_MODEL_RUNNER_OUTPUT
+        state = self.prepared_execute_states.pop(0)
 
         (scheduler_output, attn_metadata, sampling_metadata, input_ids,
          hidden_states, logits, aux_hidden_states, spec_decode_metadata,
          kv_connector_output, logits_indices_selector, padded_num_reqs,
          expert_indices, full_hidden_states, full_logits, req_ids_dp,
          padded_num_scheduled_tokens_per_dp_rank) = (
-             self.execute_model_state.scheduler_output,
-             self.execute_model_state.attn_metadata,
-             self.execute_model_state.sampling_metadata,
-             self.execute_model_state.input_ids,
-             self.execute_model_state.hidden_states,
-             self.execute_model_state.logits,
-             self.execute_model_state.aux_hidden_states,
-             self.execute_model_state.spec_decode_metadata,
-             self.execute_model_state.kv_connector_output,
-             self.execute_model_state.logits_indices_selector,
-             self.execute_model_state.padded_num_reqs,
-             self.execute_model_state.expert_indices,
-             self.execute_model_state.full_hidden_states,
-             self.execute_model_state.full_logits,
-             self.execute_model_state.req_ids_dp,
-             self.execute_model_state.padded_num_scheduled_tokens_per_dp_rank,
+             state.scheduler_output,
+             state.attn_metadata,
+             state.sampling_metadata,
+             state.input_ids,
+             state.hidden_states,
+             state.logits,
+             state.aux_hidden_states,
+             state.spec_decode_metadata,
+             state.kv_connector_output,
+             state.logits_indices_selector,
+             state.padded_num_reqs,
+             state.expert_indices,
+             state.full_hidden_states,
+             state.full_logits,
+             state.req_ids_dp,
+             state.padded_num_scheduled_tokens_per_dp_rank,
          )
-        self.execute_model_state = None
 
         if grammar_output is not None:
             (
@@ -1849,7 +1965,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 req_ids_dp, scheduled_tokens_per_dp_rank,
                 padded_num_scheduled_tokens_per_dp_rank, dp_size)
 
-        self.device_buffer.reset()
+        self.device_buffer = common_utils.DeviceBuffer(initial_capacity=1024)
 
         input_ids_view = self.device_buffer.get_view(
             (padded_total_num_scheduled_tokens, ), key="input_ids")

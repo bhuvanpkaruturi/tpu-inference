@@ -494,6 +494,12 @@ class TPUWorker(WorkerBase):
                       grammar_output: GrammarOutput) -> ModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def prepare_only(self, scheduler_output: SchedulerOutput) -> None:
+        self.model_runner.prepare_only(scheduler_output)
+
+    def dispatch_prepared_batch(self) -> Optional[ModelRunnerOutput]:
+        return self.model_runner.dispatch_prepared_batch()
+
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
 
