@@ -1139,8 +1139,8 @@ class DPScheduler(SchedulerInterface):
             self, scheduler_output: DPSchedulerOutput,
             global_model_output: ModelRunnerOutput) -> List[ModelRunnerOutput]:
         """Split the model runner output by DP rank for individual scheduler updates."""
-        if hasattr(global_model_output, "model_runner_output"):
-            g = global_model_output.model_runner_output
+        if hasattr(global_model_output, "_model_runner_output"):
+            g = global_model_output._model_runner_output
         else:
             g = global_model_output
 
