@@ -74,6 +74,7 @@ class SchedulerCommand(Enum):
     SET_PAUSE_STATE = "set_pause_state"
     GET_PAUSE_STATE = "get_pause_state"
     SHUTDOWN = "shutdown"
+    CLEAR_LAST_SCHEDULE = "clear_last_schedule"
 
 
 class SchedulerWorkerError(Exception):
@@ -288,6 +289,11 @@ def _scheduler_worker_process(
                 case SchedulerCommand.GET_PAUSE_STATE:
                     result = scheduler.pause_state
                     _send_result(result)
+
+                case SchedulerCommand.CLEAR_LAST_SCHEDULE:
+                    if _cached_scheduler_outputs:
+                        _cached_scheduler_outputs.pop()
+                    _send_result(None)
 
                 case SchedulerCommand.SHUTDOWN:
                     logger.info(f"Rank {rank}: Shutting down")
@@ -804,6 +810,13 @@ class DPScheduler(SchedulerInterface):
         # Return combined scheduler outputs
         combined_output = self._combine_scheduler_outputs(rank_outputs)
 
+        if combined_output.total_num_scheduled_tokens == 0:
+            self.cached_schedulers_output.pop()
+            for rank in range(self.dp_size):
+                self._send_command(rank, SchedulerCommand.CLEAR_LAST_SCHEDULE)
+            for rank in range(self.dp_size):
+                self._get_result(rank, SchedulerCommand.CLEAR_LAST_SCHEDULE)
+
         logger.debug(
             f"DPScheduler scheduled: "
             f"{combined_output.total_num_scheduled_tokens} total tokens, "
@@ -1074,9 +1087,11 @@ class DPScheduler(SchedulerInterface):
 
         # Clean up finished requests from DP tracking
         self._cleanup_finished_requests(scheduler_output.finished_req_ids)
+        logger.info(f"[DEBUG_DP_SCHED] finished_req_ids in scheduler_output: {scheduler_output.finished_req_ids}")
 
         # Return combined EngineCoreOutput
         stats_attached = False
+
         for client_idx, engine_outputs in combined_engine_outputs.items():
             combined_output = EngineCoreOutputs()
             outputs = []
@@ -1088,6 +1103,8 @@ class DPScheduler(SchedulerInterface):
             combined_output.engine_index = engine_outputs[0].engine_index
             combined_output.outputs = outputs
             combined_output.finished_requests = finished_requests
+            logger.info(f"[DEBUG_DP_SCHED] client_idx={client_idx} | num_outputs={len(outputs)} | finished_requests={finished_requests}")
+
             # Attach combined stats to only the first client output
             # (matching the base scheduler behavior)
             if not stats_attached and combined_stats is not None:

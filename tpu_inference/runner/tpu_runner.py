@@ -937,6 +937,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         batch = self.prepared_batches.pop(0)
 
         self.input_batch = batch.input_batch
+        self.persistent_batch_manager.input_batch = batch.input_batch
 
         scheduler_output = batch.scheduler_output
         input_ids = batch.input_ids
