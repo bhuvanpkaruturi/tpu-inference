@@ -171,6 +171,232 @@ class PcpAttentionInterfaceTest(jtu.JaxTestCase):
         return Mesh(
             np.array(jax.devices()[:pcp]).reshape(shape), MESH_AXIS_NAMES)
 
+    # ---------------------- multi-request (R > 1) ----------------------------
+    def _multi_layout(self, pcp, reqs, t_pad):
+        """The layout `_prepare_inputs` builds for R requests (design §4.1)."""
+        two_p = 2 * pcp
+        n = [r[0] for r in reqs]
+        C, off, acc = [], [], 0
+        for ni in n:
+            # max(1, ...) matters only for the zero-token slots that pad the
+            # live request count up to its static bucket; a shared offset there
+            # makes a zero-length cache-phase seq and hangs the kernel.
+            C.append(max(1, cdiv(ni, two_p)))
+            off.append(acc)
+            acc += 2 * C[-1]
+        assert t_pad % pcp == 0 and t_pad >= pcp * acc, (t_pad, pcp * acc)
+        return C, off, acc, t_pad // pcp
+
+    def _multi_cache(self, prev_kv, pcp, pps, npages):
+        """Global pcp cache with request i's cached tokens on pages
+        [i*pps, (i+1)*pps) -- disjoint blocks, as the block table says."""
+        dims = self._cache_dims(1)
+        shards = []
+        for r in range(pcp):
+            shard = np.full((npages, PAGE, *dims), np.nan, np.float32)
+            for i, (k_prev, v_prev, L) in enumerate(prev_kv):
+                idx = np.arange(r, L, pcp)
+                if not len(idx):
+                    continue
+                kv = np.asarray(merge_kv(k_prev[idx], v_prev[idx]))
+                m = kv.shape[0]
+                kv = np.pad(kv, ((0, cdiv(m, PAGE) * PAGE - m), (0, 0), (0, 0),
+                                 (0, 0)),
+                            constant_values=np.nan).reshape(-1, PAGE, *dims)
+                shard[i * pps:i * pps + kv.shape[0]] = kv
+            shards.append(shard)
+        return jnp.asarray(np.concatenate(shards, axis=1), DTYPE)
+
+    def _run_multi(self, pcp, reqs, t_pad, num_reqs_bucket=None):
+        """Drive pcp_forward with R requests. `reqs` is [(num_current, L)]."""
+        two_p = 2 * pcp
+        # Pad the request count to its static bucket, as the runner does: the
+        # cache phase reads every slot up to PCPMetadata.num_reqs.
+        live = len(reqs)
+        reqs = list(reqs) + [(0, 0)] * ((num_reqs_bucket or live) - live)
+        R = len(reqs)
+        n = [r[0] for r in reqs]
+        L = [r[1] for r in reqs]
+        C, off, s_live, s_pad = self._multi_layout(pcp, reqs, t_pad)
+        rng = np.random.default_rng(17)
+
+        prev_kv, cur, exp = [], [], []
+        pps = max(cdiv(cdiv(Li + ni, pcp), PAGE) for ni, Li in zip(n, L))
+        for i in range(R):
+            k_prev = self._rand(rng, (L[i], NKV, HD))
+            v_prev = self._rand(rng, (L[i], NKV, HD))
+            q_cur = self._rand(rng, (n[i], NQ, HD))
+            k_cur = self._rand(rng, (n[i], NKV, HD))
+            v_cur = self._rand(rng, (n[i], NKV, HD))
+            prev_kv.append((k_prev, v_prev, L[i]))
+            cur.append((q_cur, k_cur, v_cur))
+            if n[i] == 0:  # padding slot: no tokens, so no reference
+                exp.append(np.zeros((0, NQ, HD), np.float32))
+                continue
+            # Reference: plain full-causal prefill over this request's context.
+            ref_pps = cdiv(L[i] + n[i], PAGE)
+            e, _ = ref_ragged_paged_attention(
+                q_cur, k_cur, v_cur,
+                self._ref_cache(k_prev, v_prev, L[i], ref_pps),
+                jnp.pad(jnp.array([L[i] + n[i]], jnp.int32), (0, MAX_SEQ - 1)),
+                jnp.pad(jnp.arange(ref_pps, dtype=jnp.int32),
+                        (0, MAX_SEQ * ref_pps - ref_pps)),
+                jnp.pad(jnp.array([0, n[i]], jnp.int32), (0, MAX_SEQ - 1)),
+                jnp.array([0, 0, 1], jnp.int32),
+                sm_scale=SM_SCALE)
+            exp.append(np.asarray(e[:n[i]]))
+
+        # Token buffers in rank order, plus the request-major K/V permutation.
+        def empty(width):
+            return np.zeros((t_pad, width, HD), np.float32)
+
+        q_buf, k_buf, v_buf = empty(NQ), empty(NKV), empty(NKV)
+        kv_order = np.zeros(t_pad, np.int32)
+        for i in range(R):
+            kv_base = two_p * int(sum(C[:i]))
+            for h in (0, 1):
+                for r in range(pcp):
+                    c = r if h == 0 else two_p - 1 - r
+                    for j in range(C[i]):
+                        g = r * s_pad + off[i] + h * C[i] + j
+                        t = c * C[i] + j
+                        kv_order[kv_base + t] = g
+                        if t < n[i]:
+                            q_buf[g] = np.asarray(cur[i][0][t], np.float32)
+                            k_buf[g] = np.asarray(cur[i][1][t], np.float32)
+                            v_buf[g] = np.asarray(cur[i][2][t], np.float32)
+
+        def pad1(xs):
+            return jnp.pad(jnp.array(xs, jnp.int32), (0, MAX_SEQ - len(xs)))
+
+        per_seq = lambda xs: [x for x in xs for _ in (0, 1)]  # noqa: E731
+        cu_row = np.zeros(MAX_SEQ + 1, np.int32)
+        for i in range(R):
+            cu_row[2 * i + 1] = off[i] + C[i]
+            cu_row[2 * i + 2] = off[i] + 2 * C[i]
+        cu_row[2 * R + 1:] = cu_row[2 * R]
+        cu = np.tile(cu_row, (pcp, 1))
+        qpos = np.zeros((pcp, MAX_SEQ), np.int32)
+        for r in range(pcp):
+            for i in range(R):
+                qpos[r, 2 * i] = r * C[i]
+                qpos[r, 2 * i + 1] = (two_p - 1 - r) * C[i]
+
+        pi = np.zeros(MAX_SEQ * pps, np.int32)
+        for i in range(R):
+            row = np.arange(i * pps, (i + 1) * pps, dtype=np.int32)
+            pi[2 * i * pps:(2 * i + 1) * pps] = row
+            pi[(2 * i + 1) * pps:(2 * i + 2) * pps] = row
+
+        md = AttentionMetadata(
+            input_positions=jnp.zeros(1, jnp.int32),
+            seq_lens=pad1(per_seq([Li + ni for ni, Li in zip(n, L)])),
+            block_tables=jnp.asarray(pi),
+            request_distribution=jnp.array([0, 0, 2 * R], jnp.int32),
+            pcp=PCPMetadata(
+                query_start_loc=jnp.asarray(cu),
+                kv_cache_lens=pad1(per_seq(L)),
+                q_pos_offsets=jnp.asarray(qpos),
+                cache_pages=cdiv(max(L), PAGE * pcp),
+                kv_new_starts=pad1(
+                    per_seq([two_p * int(sum(C[:i])) for i in range(R)])),
+                kv_token_order=jnp.asarray(kv_order),
+                num_reqs=R,
+            ),
+        )
+        new_cache, out = pcp_forward(self._mesh(pcp),
+                                     jnp.asarray(q_buf, DTYPE),
+                                     jnp.asarray(k_buf, DTYPE),
+                                     jnp.asarray(v_buf, DTYPE),
+                                     self._multi_cache(prev_kv, pcp, pps,
+                                                       R * pps),
+                                     md,
+                                     sm_scale=SM_SCALE,
+                                     update_kv_cache=True,
+                                     use_causal_mask=True)
+        return (np.asarray(out), np.asarray(new_cache), exp, cur, C, off,
+                s_pad, pps)
+
+    @parameterized.product(pcp=[2, 4])
+    def test_multirequest_ragged(self, pcp):
+        """R requests of different lengths, mixed cached/uncached, in one call.
+
+        Each request must see only its own K/V: a wrong kv_new_starts or a
+        wrong cache-phase seq split silently mixes requests together.
+        """
+        if jax.device_count() < pcp:
+            self.skipTest(f"needs >= {pcp} devices")
+        reqs = [(96, 0), (48, 64), (33, 32)]
+        out, _, exp, _, C, off, s_pad, _ = self._run_multi(pcp, reqs, 256)
+        two_p = 2 * pcp
+        checked = 0
+        for i, (ni, _) in enumerate(reqs):
+            for t in range(ni):
+                c = t // C[i]
+                r = c if c < pcp else two_p - 1 - c
+                h = 0 if c < pcp else 1
+                got = out[r * s_pad + off[i] + h * C[i] + t % C[i]]
+                self.assertTrue(np.all(np.isfinite(got)))
+                self.assertAllClose(got, exp[i][t], atol=2e-2, rtol=2e-2)
+                checked += 1
+        self.assertEqual(checked, sum(n for n, _ in reqs))
+
+    @parameterized.product(pcp=[2, 4])
+    def test_multirequest_fewer_reqs_than_bucket(self, pcp):
+        """Live request count BELOW the static num_reqs bucket, with cache.
+
+        This is the shape that hung a real 8k server: the cache phase reads
+        request slots up to PCPMetadata.num_reqs, so the slots padding the live
+        count up to the bucket must still carry distinct offsets. Every request
+        here has L > 0 so the cache phase actually runs -- with L == 0 it is
+        elided and the bug is invisible, which is exactly why the 1k E2E run
+        passed while 8k stalled.
+        """
+        if jax.device_count() < pcp:
+            self.skipTest(f"needs >= {pcp} devices")
+        # 2 live against a bucket of 4. Bounded by MAX_SEQ: a bucket of B
+        # needs 2*B seq slots, so 4 is the largest that fits 8. It still
+        # leaves bucket-live-1 = 1 degenerate seq under the old code, which is
+        # all it takes to hang.
+        reqs = [(96, 32), (48, 64)]
+        out, _, exp, _, C, off, s_pad, _ = self._run_multi(pcp,
+                                                          reqs,
+                                                          512,
+                                                          num_reqs_bucket=4)
+        two_p = 2 * pcp
+        checked = 0
+        for i, (ni, _) in enumerate(reqs):
+            for t in range(ni):
+                c = t // C[i]
+                r = c if c < pcp else two_p - 1 - c
+                h = 0 if c < pcp else 1
+                got = out[r * s_pad + off[i] + h * C[i] + t % C[i]]
+                self.assertTrue(np.all(np.isfinite(got)))
+                self.assertAllClose(got, exp[i][t], atol=2e-2, rtol=2e-2)
+                checked += 1
+        self.assertEqual(checked, sum(n for n, _ in reqs))
+
+    @parameterized.product(pcp=[2, 4])
+    def test_multirequest_kv_cache_write(self, pcp):
+        """Every request's current KV lands in ITS OWN pages, strided by rank.
+
+        With one shared write gate only the last request's KV would be written
+        (and to whichever pages seq 2R-1 addresses), so this is the check that
+        kv_write_seq_mask and the per-request block-table rows work together.
+        """
+        if jax.device_count() < pcp:
+            self.skipTest(f"needs >= {pcp} devices")
+        reqs = [(96, 0), (48, 64), (33, 32)]
+        _, cache, _, cur, _, _, _, pps = self._run_multi(pcp, reqs, 256)
+        for i, (ni, Li) in enumerate(reqs):
+            ref = np.asarray(merge_kv(cur[i][1], cur[i][2]))
+            for t in range(ni):
+                g = Li + t  # global position within request i
+                r, local = g % pcp, g // pcp
+                page = i * pps + local // PAGE
+                got = cache[page, r * PAGE + local % PAGE]
+                self.assertAllClose(got, ref[t], atol=2e-2, rtol=2e-2)
+
     def _run(self, pcp, L, num_current, padded_s):
         """Drive the wrapper; return (out_rank_order, kv_cache, exp_token_order).
 
