@@ -22,8 +22,11 @@ from vllm.utils.math_utils import cdiv
 
 @functools.partial(
     jax.tree_util.register_dataclass,
-    data_fields=["query_start_loc", "kv_cache_lens", "q_pos_offsets"],
-    meta_fields=["cache_pages"],
+    data_fields=[
+        "query_start_loc", "kv_cache_lens", "q_pos_offsets", "kv_new_starts",
+        "kv_token_order"
+    ],
+    meta_fields=["cache_pages", "num_reqs"],
 )
 @dataclass
 class PCPMetadata:
@@ -43,7 +46,24 @@ class PCPMetadata:
     # the gather-KV cache all-gather.  0 means nothing is cached, in which case
     # the cache phase is elided entirely.  REQUIRED: a default would silently
     # elide the cache phase for any caller that forgot to set it.
+    # With several requests in flight this bounds EVERY request (it is taken
+    # over the batch), which is all the `== 0` elision and the strategy choice
+    # need; gather-KV itself is disabled for num_reqs > 1.
     cache_pages: int
+    # (max_num_seqs,) int32 — base offset of each fused seq's current-KV block
+    # inside the all-gathered new-KV buffer.  Replicated (P()).  None for a
+    # single request, where every block starts at 0 and the kernel's implicit
+    # base of 0 is already right.
+    kv_new_starts: jax.Array | None = None
+    # (padded_num_tokens,) int32 — permutation taking the all-gathered current
+    # K/V from rank order to request-major token order.  Replicated (P()).
+    # None keeps the single-request fast path, where the kernel remaps
+    # addresses itself via `pcp_chunk_size`.
+    kv_token_order: jax.Array | None = None
+    # STATIC (meta field): number of requests fused into this launch, padded to
+    # its own bucket ladder.  1 keeps the batch on exactly the single-request
+    # code path (including gather-KV) rather than the multi-request one.
+    num_reqs: int = 1
 
 
 @functools.partial(
@@ -147,6 +167,37 @@ def pcp_cache_page_buckets(max_num_blocks_per_req: int) -> list[int]:
             v = 1 << max(0, round(math.exp(step * i)).bit_length() - 1)
             buckets.add(min(max(v, 1), max_num_blocks_per_req))
     return sorted(buckets)
+
+
+def pcp_token_layout(num_scheduled_tokens: list[int],
+                     pcp_size: int,
+                     align: int = 1) -> tuple[list[int], list[int], int]:
+    """Per-request zigzag chunking for multi-request PCP.
+
+    Each request is split into its own 2*pcp_size chunks, and its head+tail
+    pair occupies a fixed-width slot in every rank's region of the token
+    buffer. Returns (C, off, S):
+
+      C[i]   chunk size of request i, ceil(n_i / 2P) rounded up to `align`
+      off[i] start of request i's slot within one rank's region
+      S      live tokens per rank; the global buffer needs pcp_size * S rows
+
+    `align` > 1 trades padding for page-aligned chunks; 1 (the default) is the
+    layout the JAX-side K/V reorder expects.
+    """
+    two_p = 2 * pcp_size
+    off, acc, C = [], 0, []
+    for n in num_scheduled_tokens:
+        # max(1, ...) only bites for n == 0, i.e. the slots that pad the live
+        # request count up to its static bucket. Those still need a nonzero
+        # chunk: the cache phase derives its seq boundaries from these offsets,
+        # and two slots sharing an offset make a zero-length sequence, which
+        # hangs the kernel.
+        c = max(1, cdiv(cdiv(n, two_p), align) * align)
+        C.append(c)
+        off.append(acc)
+        acc += 2 * c
+    return C, off, acc
 
 
 def round_up_pcp_cache_pages(num_computed_tokens: int, block_size: int,
